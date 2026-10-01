@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sailfish-devel-mcp"
+version = "0.1.0"
+description = "Host-side MCP server for Sailfish OS development workflows"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "0BSD" }
+authors = [{ name = "Andrew Branson" }]
+dependencies = []
+
+[project.scripts]
+sailfish-devel-mcp = "sailfish_devel_mcp.server:main"
+sailfish-devel-jobs = "sailfish_devel_mcp.jobs:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sailfish_devel_mcp = ["vendor/build-helper.json"]

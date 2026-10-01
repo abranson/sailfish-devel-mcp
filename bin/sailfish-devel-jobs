@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+export PYTHONPATH="$root/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m sailfish_devel_mcp.jobs "$@"

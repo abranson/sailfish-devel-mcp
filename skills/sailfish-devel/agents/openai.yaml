@@ -1,0 +1,6 @@
+interface:
+  display_name: "Sailfish Development"
+  short_description: "Deploy, debug and monitor SailfishOS work."
+  default_prompt: "Use $sailfish-devel to deploy and inspect this SailfishOS change."
+policy:
+  allow_implicit_invocation: true

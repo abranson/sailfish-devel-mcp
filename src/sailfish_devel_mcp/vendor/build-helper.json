@@ -1,0 +1,7 @@
+{
+  "helper_version": "2.4.4",
+  "sha256": "b564395cd1a3bcb78c787b9375f4af0868241d3737aa7ac015974796e4106796",
+  "source": "build-sailfishos-skill/scripts/build_sailfishos.py",
+  "source_dirty": false,
+  "source_revision": "57ad5cb2710ed41c14c2fd5b2f2942f32a5131fb"
+}

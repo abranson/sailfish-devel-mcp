@@ -1,0 +1,14 @@
+.mypy_cache/
+.pytest_cache/
+__pycache__/
+*.egg-info/
+*.pyc
+.venv/
+build/
+dist/
+.agents/
+.codex/
+/AGENTS.md
+/TASK.md
+/config.json
+*.log

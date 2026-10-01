@@ -1,0 +1,85 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PYTHONPATH="$root/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+export PYTHONUNBUFFERED
+server_label="${SAILFISH_DEVEL_MCP_SERVER_LABEL:-sailfish-devel-mcp}"
+
+if [ -n "${SAILFISH_DEVEL_MCP_LOG_DIR:-}" ]; then
+    log_dir=$SAILFISH_DEVEL_MCP_LOG_DIR
+elif [ -n "${XDG_STATE_HOME:-}" ]; then
+    log_dir=$XDG_STATE_HOME/sailfish-devel-mcp
+elif [ -n "${HOME:-}" ]; then
+    log_dir=$HOME/.local/state/sailfish-devel-mcp
+else
+    log_dir=/tmp/sailfish-devel-mcp
+fi
+
+log_file=$log_dir/server.log
+if mkdir -p "$log_dir" 2>/dev/null && touch "$log_file" 2>/dev/null; then
+    {
+        log_line() {
+            printf '[%s] %s\n' "$(date -Is)" "$*" >&2
+        }
+
+        log_exit_once() {
+            status=$1
+            if [ "$exit_logged" -eq 0 ]; then
+                log_line "sailfish-devel-mcp exited status=$status"
+                exit_logged=1
+            fi
+        }
+
+        on_signal() {
+            signal=$1
+            log_line "sailfish-devel-mcp wrapper received signal=$signal"
+            if [ -n "$child_pid" ]; then
+                kill "-$signal" "$child_pid" 2>/dev/null || true
+                wait "$child_pid"
+                status=$?
+            else
+                status=128
+            fi
+            log_exit_once "$status"
+            exit "$status"
+        }
+
+        child_pid=
+        exit_logged=0
+
+        trap 'on_signal HUP' HUP
+        trap 'on_signal INT' INT
+        trap 'on_signal QUIT' QUIT
+        trap 'on_signal TERM' TERM
+        trap 'status=$?; log_exit_once "$status"' EXIT
+
+        printf '\n' >&2
+        printf '[%s] starting sailfish-devel-mcp server_label=%s wrapper_pid=%s parent_pid=%s' \
+            "$(date -Is)" "$server_label" "$$" "${PPID:-unknown}" >&2
+        if [ "$#" -gt 0 ]; then
+            printf ' argv=' >&2
+            for arg do
+                printf ' %s' "$arg" >&2
+            done
+        fi
+        printf '\n' >&2
+
+        exec 3<&0
+        set +e
+        python3 -m sailfish_devel_mcp "$@" <&3 &
+        child_pid=$!
+        log_line "sailfish-devel-mcp python_pid=$child_pid"
+        wait "$child_pid"
+        status=$?
+        exec 3<&-
+        child_pid=
+        set -e
+        log_exit_once "$status"
+        exit "$status"
+    } 2>>"$log_file"
+fi
+
+exec python3 -m sailfish_devel_mcp "$@"

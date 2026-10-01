@@ -1,0 +1,30 @@
+{
+  "default_device": "phone",
+  "devices": {
+    "phone": {
+      "ssh_target": "root@phone",
+      "username": "defaultuser",
+      "architecture": "aarch64",
+      "release": "live",
+      "user_bus_runtime_dir": "/run/user/100000",
+      "user_bus_address": "unix:path=/run/user/100000/dbus/user_bus_socket"
+    }
+  },
+  "paths": {
+    "git_root": "~/git",
+    "obs_root": "~/OBS",
+    "ssh_config": "~/.ssh/config",
+    "local_sdk": "/srv/mer/sdks/sfossdk/sdk-chroot",
+    "osc_api_alias": "primary",
+    "obs_servers": {
+      "primary": "primary",
+      "community": "community"
+    }
+  },
+  "default_android_build_host": "android-builder",
+  "android_build_hosts": {
+    "android-builder": {
+      "ssh_target": "user@android-build-host"
+    }
+  }
+}
