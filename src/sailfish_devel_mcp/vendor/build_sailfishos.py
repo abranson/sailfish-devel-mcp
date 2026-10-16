@@ -26,7 +26,7 @@ CONTAINER_UID = 100000
 # Third-party mirror. Its tags describe available build images, not the current
 # official SailfishOS release or installed SDK target.
 CONTAINER_IMAGE = "coderus/sailfishos-platform-sdk"
-HELPER_VERSION = "2.4.4"
+HELPER_VERSION = "2.5.1"
 LIVE_RELEASE = "live"
 LOCAL_SDK_CANDIDATES = (
     Path("/srv/mer/sdks/sfossdk/sdk-chroot"),
@@ -136,6 +136,13 @@ class BuildContext:
     image: str | None
     image_id: str | None
     local_sdk: str | None
+
+
+def snapshot_recipe_path(local_sdk: Path, target: str) -> Path:
+    identity = f"{local_sdk.resolve(strict=False)}\0{canonical_local_target_name(target)}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache_root / STATE_DIRNAME / "snapshot-recipes" / f"{digest}.json"
 
 
 def log(message: str, *, force: bool = False) -> None:
@@ -572,6 +579,38 @@ def spec_names(project_dir: Path) -> set[str]:
     return names
 
 
+def spec_candidates(project_dir: Path) -> list[Path]:
+    return sorted((project_dir / "rpm").glob("*.spec"))
+
+
+def resolve_spec(project_dir: Path, requested: str | None) -> Path:
+    candidates = spec_candidates(project_dir)
+    labels = ", ".join(str(path.relative_to(project_dir)) for path in candidates)
+    if not candidates:
+        raise SystemExit(f"No RPM spec files found in {project_dir / 'rpm'}.")
+    if requested:
+        value = Path(requested)
+        if value.is_absolute() or len(value.parts) > 1:
+            try:
+                value = (value if value.is_absolute() else project_dir / value).resolve().relative_to(project_dir.resolve())
+            except ValueError:
+                value = Path("__outside_project__")
+            matches = [path for path in candidates if value == path.relative_to(project_dir)]
+        else:
+            matches = [path for path in candidates if value.name == path.name]
+        if len(matches) != 1:
+            detail = f" Candidates: {labels}" if labels else ""
+            raise SystemExit(f"Unknown RPM spec {requested!r}.{detail}")
+        return matches[0]
+    if len(candidates) != 1:
+        raise SystemExit(f"Multiple RPM specs found; pass --spec. Candidates: {labels}")
+    return candidates[0]
+
+
+def spec_relative_path(project_dir: Path, spec: Path) -> str:
+    return str(spec.resolve().relative_to(project_dir.resolve()))
+
+
 def pro_targets(project_dir: Path) -> set[str]:
     targets: set[str] = set()
     for pro in sorted(project_dir.glob("*.pro")):
@@ -705,6 +744,9 @@ def write_build_metadata(
     started_at: datetime,
     failure_class: str | None = None,
     failure_message: str | None = None,
+    spec: Path | None = None,
+    snapshot_inputs: dict[str, object] | None = None,
+    provenance: dict[str, object] | None = None,
 ) -> None:
     metadata_file = build_metadata_path(project_dir)
     finished_at = datetime.now(timezone.utc)
@@ -714,8 +756,18 @@ def write_build_metadata(
         serialized["rpms"] = [str(path) for path in build.get("rpms", [])]
         serialized_builds.append(serialized)
     rpms = [path for build in serialized_builds for path in build.get("rpms", [])]
+    provenance = dict(provenance or source_provenance(project_dir, spec))
+    provenance["sdk_base_inputs"] = {
+        "recipe": snapshot_inputs,
+        "base_metadata": provenance.get("base_metadata"),
+        "release": context.release,
+        "image_id": context.image_id,
+        "local_sdk": context.local_sdk,
+        "targets": [build.get("base_target", build.get("target")) for build in serialized_builds],
+    }
+    provenance["artifact_checksums"] = rpm_checksums(Path(path) for path in rpms)
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "helper_version": HELPER_VERSION,
         "started_utc": started_at.isoformat(),
         "updated_utc": finished_at.isoformat(),
@@ -735,6 +787,13 @@ def write_build_metadata(
         "builds": serialized_builds,
         "rpms": rpms,
         "rpmlint": rpmlint_summary(build_log_path(project_dir)),
+        "provenance": provenance,
+        "source_commit": provenance["commit"],
+        "source_dirty": provenance["dirty"],
+        "dirty_fingerprint": provenance["dirty_fingerprint"],
+        "spec": provenance["spec"],
+        "sdk_base_inputs": provenance["sdk_base_inputs"],
+        "artifact_checksums": provenance["artifact_checksums"],
     }
     write_json_atomic(metadata_file, payload)
 
@@ -1087,11 +1146,9 @@ fi
 def sdk_refresh_target(local_sdk: Path, target: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", target):
         raise ValueError("invalid SDK target name")
-    canonical_target = canonical_local_target_name(target)
-    if target.endswith(".default"):
-        return f"{canonical_target}.default"
-    metadata = target_metadata(local_sdk_targets_dir(local_sdk) / canonical_target)
-    return canonical_target if metadata.get("snapshot_of") else f"{canonical_target}.default"
+    # Refresh is an administrative operation on the requested target, not a
+    # build: a base name must not silently select its .default snapshot.
+    return target
 
 
 def sdk_refresh_command(local_sdk: Path, target: str, force: bool = False) -> list[str]:
@@ -1220,6 +1277,157 @@ def validate_snapshot_packages(values: list[str]) -> list[str]:
             raise SystemExit("Snapshot package names must be non-empty single-line values")
         packages.append(value)
     return packages
+
+
+def snapshot_recipe(
+    project_dir: Path,
+    repositories: list[SnapshotRepository],
+    packages: list[str],
+    local_rpms: dict[Path, list[Path]] | list[Path],
+) -> dict[str, object]:
+    rpms: list[dict[str, str]] = []
+    if isinstance(local_rpms, dict):
+        selected = local_rpms.values()
+    else:
+        selected = (
+            usable_local_rpms(directory) if isinstance(directory, Path) else directory
+            for directory in local_rpms
+        )
+    for paths in selected:
+        for path in paths:
+            digest = file_sha256(path)
+            rpms.append({"name": path.name, "sha256": digest})
+    return {
+        "repositories": sorted([{"alias": item.alias, "url": item.url} for item in repositories], key=lambda item: item["alias"]),
+        "packages": sorted(packages),
+        "rpms": sorted(rpms, key=lambda item: (item["name"], item["sha256"])),
+    }
+
+
+def check_snapshot_recipe(
+    local_sdk: Path,
+    target: str,
+    recipe: dict[str, object],
+    reset: bool,
+    *,
+    managed_snapshot_exists: bool = False,
+    resume: bool = False,
+) -> bool:
+    path = snapshot_recipe_path(local_sdk, target)
+    if reset and resume:
+        raise SystemExit("Cannot reset and resume a snapshot together")
+    if resume and not managed_snapshot_exists:
+        raise SystemExit("Cannot resume a missing managed SDK snapshot")
+    if reset:
+        return True
+    if not path.is_file():
+        if managed_snapshot_exists and not reset:
+            raise SystemExit(
+                "Managed SDK snapshot has no recorded input recipe. Re-run with "
+                "--reset-snapshot before adopting its inputs."
+            )
+        return False
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        if reset:
+            return True
+        raise SystemExit(f"Cannot read snapshot recipe {path}: {exc}; use --reset-snapshot to recover") from exc
+    if previous == recipe and not reset:
+        return False
+    if previous == {"pending": True, "recipe": recipe}:
+        if resume:
+            # Explicit recovery reruns the same preparation without erasing the
+            # existing snapshot. Unknown or different recipes remain rejected.
+            return False
+        raise SystemExit(
+            "Managed SDK snapshot preparation was interrupted. Re-run with "
+            "--resume-snapshot to reapply the identical recipe without resetting, "
+            "or --reset-snapshot for a clean preparation."
+        )
+    if not reset:
+        raise SystemExit(
+            "Managed SDK snapshot inputs changed (repositories, packages, or RPM hashes). "
+            "Re-run with --reset-snapshot to reset and reapply the recipe."
+        )
+    return True
+
+
+def write_snapshot_recipe(local_sdk: Path, target: str, recipe: dict[str, object]) -> None:
+    write_json_atomic(snapshot_recipe_path(local_sdk, target), recipe)
+
+
+@contextmanager
+def snapshot_preparation(
+    project_dir: Path,
+    local_sdk: Path,
+    target: str,
+    recipe: dict[str, object],
+    reset: bool,
+    resume: bool = False,
+):
+    # The caller holds the target lock throughout preparation and the build.
+    exists = (local_sdk_targets_dir(local_sdk) / canonical_local_target_name(target)).is_dir()
+    reset_required = check_snapshot_recipe(
+        local_sdk, target, recipe, reset, managed_snapshot_exists=exists, resume=resume)
+    state_dir = project_dir / ".mb2"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="snapshot-preparation-", dir=state_dir) as directory:
+        marker = Path(directory) / "ready"
+        write_snapshot_recipe(local_sdk, target, {"pending": True, "recipe": recipe})
+        try:
+            yield reset_required, marker
+        finally:
+            # The wrapper creates this only after reset and custom input installs
+            # finish. A later mb2 dependency/compile/test failure can be retried
+            # with the same recipe; interrupted preparation needs explicit recovery.
+            if marker.is_file():
+                write_snapshot_recipe(local_sdk, target, recipe)
+
+
+def source_provenance(project_dir: Path, spec: Path | None = None) -> dict[str, object]:
+    commit = None
+    dirty = None
+    try:
+        commit = subprocess.run(["git", "-C", str(project_dir), "rev-parse", "HEAD"], text=True, capture_output=True, check=False).stdout.strip() or None
+        status_result = subprocess.run(["git", "-C", str(project_dir), "status", "--porcelain=v1"], text=True, capture_output=True, check=False)
+        diff_result = subprocess.run(["git", "-C", str(project_dir), "diff", "--binary", "--submodule=diff", "HEAD"], text=False, capture_output=True, check=False)
+        status = status_result.stdout
+        dirty = status_result.returncode == 0 and bool(status.strip())
+        fingerprint_hash = hashlib.sha256(diff_result.stdout)
+        untracked = subprocess.run(
+            ["git", "-C", str(project_dir), "ls-files", "--others", "--exclude-standard", "-z"],
+            text=False, capture_output=True, check=False,
+        ).stdout.split(b"\0")
+        for relative in untracked:
+            if not relative:
+                continue
+            path = project_dir / os.fsdecode(relative)
+            fingerprint_hash.update(relative)
+            try:
+                fingerprint_hash.update((os.readlink(path) if path.is_symlink() else file_sha256(path)).encode())
+            except OSError:
+                pass
+        submodules = subprocess.run(["git", "-C", str(project_dir), "submodule", "status"], text=True, capture_output=True, check=False)
+        fingerprint_hash.update(submodules.stdout.encode("utf-8"))
+        if status_result.returncode != 0:
+            dirty = None
+        fingerprint = fingerprint_hash.hexdigest() if status_result.returncode == 0 else None
+    except OSError:
+        fingerprint = None
+    return {"commit": commit, "dirty": dirty, "dirty_fingerprint": fingerprint, "spec": spec_relative_path(project_dir, spec) if spec else None}
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def rpm_checksums(paths: Iterable[Path]) -> dict[str, str]:
+    return {str(path): file_sha256(path) for path in paths if path.is_file()}
 
 
 def canonical_local_target_name(name: str) -> str:
@@ -1465,6 +1673,10 @@ def build_local_sdk_arch(
     snapshot_packages: list[str] | None = None,
     no_vcs_apply: bool = True,
     allow_untrusted_rpms: bool = False,
+    spec: Path | None = None,
+    reset_snapshot: bool = False,
+    preparation_marker: Path | None = None,
+    resume_snapshot: bool = False,
 ) -> None:
     user = host_user()
     uid = os.getuid()
@@ -1487,6 +1699,7 @@ def build_local_sdk_arch(
         f"{repository.alias}\t{repository.url}" for repository in snapshot_repositories
     )
     package_recipe = "\n".join(snapshot_packages)
+    spec_name = spec_relative_path(project_dir, spec) if spec else ""
 
     inner_command = r'''
 set -euo pipefail
@@ -1508,9 +1721,14 @@ logfile="$BUILD_LOG"
 # The registered architecture target is an immutable base. Custom inputs use
 # an isolated snapshot that is reset after the base changes and built directly.
 # Ordinary base builds retain mb2's shared .default working snapshot.
-if [ "$TARGET" != "$BASE_TARGET" ]; then
-  sdk-manage target snapshot --reset=outdated --no-sync \
-    "$BASE_TARGET" "$TARGET" 2>&1 | tee -a "$logfile"
+if [ "$TARGET" != "$BASE_TARGET" ] && [ -z "${RESUME_SNAPSHOT:-}" ]; then
+  if [ -n "${RESET_SNAPSHOT:-}" ]; then
+    sdk-manage target snapshot --reset=force --no-sync \
+      "$BASE_TARGET" "$TARGET" 2>&1 | tee -a "$logfile"
+  else
+    sdk-manage target snapshot --reset=outdated --no-sync \
+      "$BASE_TARGET" "$TARGET" 2>&1 | tee -a "$logfile"
+  fi
 fi
 
 if [ -n "${SNAPSHOT_REPOSITORIES:-}" ]; then
@@ -1562,7 +1780,14 @@ if [ -n "${LOCAL_RPM_DIRS:-}" ]; then
   fi
 fi
 
+if [ -n "${PREPARATION_MARKER:-}" ]; then
+  : > "$PREPARATION_MARKER"
+fi
+
 mb2_args=( -t "$TARGET" )
+if [ -n "${SPEC:-}" ]; then
+  mb2_args+=( -s "$SPEC" )
+fi
 if [ "$TARGET" != "$BASE_TARGET" ]; then
   mb2_args+=( --no-snapshot=force )
 fi
@@ -1619,6 +1844,10 @@ fi
   SNAPSHOT_PACKAGES="$SNAPSHOT_PACKAGES" \
   NO_VCS_APPLY="$NO_VCS_APPLY" \
   ALLOW_UNTRUSTED_RPMS="$ALLOW_UNTRUSTED_RPMS" \
+  SPEC="$SPEC" \
+  RESET_SNAPSHOT="$RESET_SNAPSHOT" \
+  PREPARATION_MARKER="$PREPARATION_MARKER" \
+  RESUME_SNAPSHOT="$RESUME_SNAPSHOT" \
   SYNC_BINARIES="$SYNC_BINARIES" \
   bash -lc {shlex.quote(inner_command)}
 '''
@@ -1665,6 +1894,14 @@ fi
             "-e",
             f"ALLOW_UNTRUSTED_RPMS={'1' if allow_untrusted_rpms else '0'}",
             "-e",
+            f"SPEC={spec_name}",
+            "-e",
+            f"RESET_SNAPSHOT={'1' if reset_snapshot else ''}",
+            "-e",
+            f"PREPARATION_MARKER={preparation_marker or ''}",
+            "-e",
+            f"RESUME_SNAPSHOT={'1' if resume_snapshot else ''}",
+            "-e",
             f"SYNC_BINARIES={binary_names}",
             image,
             "bash",
@@ -1682,11 +1919,13 @@ def build_arch(
     local_rpm_dirs: list[Path] | None = None,
     no_vcs_apply: bool = False,
     allow_untrusted_rpms: bool = False,
+    spec: Path | None = None,
 ) -> None:
     image = f"{CONTAINER_IMAGE}:{release}"
     target = f"SailfishOS-{release}-{arch}"
     binary_names = ":".join(sorted(spec_names(project_dir) | pro_targets(project_dir)))
     is_gecko_build = (project_dir / "gecko-dev").is_dir() and (project_dir / "rpm" / "xulrunner-qt5.spec").is_file()
+    spec_name = spec_relative_path(project_dir, spec) if spec else ""
     local_rpm_dirs = local_rpm_dirs or []
     local_rpm_mounts = [f"/local-rpms/{index}" for index, _ in enumerate(local_rpm_dirs)]
     build_command = r'''
@@ -1749,6 +1988,9 @@ if [ -n "${LOCAL_RPM_DIRS:-}" ]; then
 fi
 
 mb2_args=( -t "$TARGET" )
+if [ -n "${SPEC:-}" ]; then
+  mb2_args+=( -s "$SPEC" )
+fi
 if [ "${IS_GECKO_BUILD:-0}" = "1" ] || [ "${NO_VCS_APPLY:-0}" = "1" ]; then
   mb2_args+=( --no-vcs-apply )
 fi
@@ -1858,6 +2100,8 @@ PY
                 "-e",
                 f"ALLOW_UNTRUSTED_RPMS={'1' if allow_untrusted_rpms else '0'}",
                 "-e",
+                f"SPEC={spec_name}",
+                "-e",
                 f"IS_GECKO_BUILD={'1' if is_gecko_build else '0'}",
                 image,
                 "bash",
@@ -1934,6 +2178,7 @@ def build_preflight_payload(
     allow_untrusted_rpms: bool,
     pull_policy: str,
     image_available: bool | None,
+    spec: Path | None = None,
 ) -> dict[str, object]:
     planned_builds = [
         {
@@ -1962,6 +2207,7 @@ def build_preflight_payload(
         "schema_version": 1,
         "helper_version": HELPER_VERSION,
         "project_dir": str(project_dir),
+        "spec": spec_relative_path(project_dir, spec) if spec else None,
         "backend": context.backend,
         "release": context.release,
         "image": context.image,
@@ -1994,12 +2240,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     selected_local_sdk = default_local_sdk()
     parser = argparse.ArgumentParser(description="Build a SailfishOS project with Docker or an installed SDK")
     parser.add_argument("--doctor", action="store_true", help="Report local tools and SDK targets as JSON without building")
-    parser.add_argument("--refresh-metadata", action="store_true", help="Refresh one installed SDK working target, without building")
+    parser.add_argument("--refresh-metadata", action="store_true", help="Refresh the exact installed SDK target named by --target, without building")
     parser.add_argument("--force-refresh", action="store_true", help="Force metadata refresh with zypper ref -f")
     parser.add_argument("--version", action="version", version=f"%(prog)s {HELPER_VERSION}")
     parser.add_argument("--project-dir", default=".", help="Project root containing rpm/*.spec")
     parser.add_argument("--release", help="SailfishOS release, for example 3.4.0.24")
     parser.add_argument("--arch", action="append", default=[], help="Architecture to build, may be repeated")
+    parser.add_argument("--spec", help="RPM spec file to build when the project contains more than one")
     parser.add_argument(
         "--target",
         action="append",
@@ -2013,6 +2260,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "builds share the base target's .default snapshot; custom inputs "
             "default to an ESR-aware key or the package/repository name"
         ),
+    )
+    parser.add_argument(
+        "--reset-snapshot",
+        action="store_true",
+        help="Reset and reapply a managed SDK snapshot when its input recipe changed",
+    )
+    parser.add_argument(
+        "--resume-snapshot",
+        action="store_true",
+        help="Reapply an existing snapshot's identical recorded recipe without resetting it",
     )
     parser.add_argument(
         "--snapshot-repository",
@@ -2118,6 +2375,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("snapshot options require --backend local or auto")
     if args.local_sdk and args.backend == "docker":
         parser.error("--local-sdk cannot be combined with --backend docker")
+    if (args.reset_snapshot or args.resume_snapshot) and args.backend == "docker":
+        parser.error("snapshot recovery requires --backend local or auto")
+    if args.reset_snapshot and args.resume_snapshot:
+        parser.error("--reset-snapshot and --resume-snapshot are mutually exclusive")
     return args
 
 
@@ -2149,6 +2410,7 @@ def main(argv: list[str] | None = None) -> int:
 
     requested_project_dir = Path(args.project_dir).resolve()
     project_dir = resolve_project_dir(requested_project_dir)
+    selected_spec = None if args.list_arches else resolve_spec(project_dir, args.spec)
 
     if args.no_pull:
         args.pull_policy = "never"
@@ -2240,6 +2502,8 @@ def main(argv: list[str] | None = None) -> int:
     local_rpm_dirs = [Path(path).resolve() for path in args.local_rpms_dir]
     selected_local_rpms = validate_local_rpm_dirs(local_rpm_dirs)
     snapshot_key: str | None = None
+    snapshot_recipe_data: dict[str, object] | None = None
+    reset_snapshot = False
     if use_local_sdk:
         assert local_builds is not None
         snapshot_key, local_builds = plan_local_sdk_snapshots(
@@ -2250,6 +2514,13 @@ def main(argv: list[str] | None = None) -> int:
                 snapshot_repositories or snapshot_packages or selected_local_rpms
             ),
         )
+        snapshot_recipe_data = snapshot_recipe(
+            project_dir, snapshot_repositories, snapshot_packages, selected_local_rpms
+        )
+        snapshot_recipe_data["snapshot_key"] = snapshot_key
+        if (args.reset_snapshot or args.resume_snapshot) and snapshot_key is None:
+            raise SystemExit("Snapshot recovery requires a managed SDK snapshot (pass --snapshot-key or custom inputs).")
+        reset_snapshot = args.reset_snapshot
 
     if use_local_sdk:
         builds: list[LocalSdkBuild | str] = local_builds
@@ -2289,7 +2560,23 @@ def main(argv: list[str] | None = None) -> int:
             allow_untrusted_rpms=args.allow_untrusted_rpms,
             pull_policy=args.pull_policy,
             image_available=image_available,
+            spec=selected_spec,
         )
+        payload["reset_snapshot"] = args.reset_snapshot
+        payload["resume_snapshot"] = args.resume_snapshot
+        payload["snapshot_inputs"] = snapshot_recipe_data
+        payload["snapshot_input_checks"] = []
+        if use_local_sdk and snapshot_key is not None:
+            for build in builds:
+                exists = (local_sdk_targets_dir(local_sdk_path) / build.snapshot).is_dir()
+                try:
+                    check_snapshot_recipe(local_sdk_path, build.snapshot, snapshot_recipe_data,
+                                          args.reset_snapshot, managed_snapshot_exists=exists,
+                                          resume=args.resume_snapshot)
+                    check = {"target": build.snapshot, "reset_required": False}
+                except SystemExit as error:
+                    check = {"target": build.snapshot, "reset_required": True, "reason": str(error)}
+                payload["snapshot_input_checks"].append(check)
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))
         else:
@@ -2301,6 +2588,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     started_at = datetime.now(timezone.utc)
+    build_provenance = source_provenance(project_dir, selected_spec)
+    if use_local_sdk:
+        build_provenance["base_metadata"] = {
+            build.target: target_metadata(local_sdk_targets_dir(local_sdk_path) / build.target)
+            for build in builds
+        }
+    else:
+        build_provenance["dependency_inputs"] = snapshot_recipe(
+            project_dir, snapshot_repositories, snapshot_packages, selected_local_rpms)
     all_copied_rpms: list[Path] = []
     build_records: list[dict[str, object]] = []
     rpm_context = stage_local_sdk_rpms(project_dir, selected_local_rpms) if use_local_sdk else nullcontext(local_rpm_dirs)
@@ -2333,6 +2629,9 @@ def main(argv: list[str] | None = None) -> int:
                 artifacts_dir=artifacts_dir,
                 status="running",
                 started_at=started_at,
+                spec=selected_spec,
+                snapshot_inputs=snapshot_recipe_data,
+                provenance=build_provenance,
             )
             build_started = time.monotonic()
             try:
@@ -2354,20 +2653,31 @@ def main(argv: list[str] | None = None) -> int:
                         else nullcontext()
                     )
                     with target_lock:
-                        build_local_sdk_arch(
-                            project_dir,
-                            local_sdk_path,
-                            release,
-                            arch,
-                            build.target,
-                            build.snapshot,
-                            debug_build=args.debug,
-                            local_rpm_dirs=effective_local_rpm_dirs,
-                            snapshot_repositories=snapshot_repositories,
-                            snapshot_packages=snapshot_packages,
-                            no_vcs_apply=no_vcs_apply,
-                            allow_untrusted_rpms=args.allow_untrusted_rpms,
+                        preparation = (
+                            snapshot_preparation(project_dir, local_sdk_path, build.snapshot,
+                                                 snapshot_recipe_data, args.reset_snapshot,
+                                                 resume=args.resume_snapshot)
+                            if snapshot_key is not None else nullcontext((False, None))
                         )
+                        with preparation as (reset_snapshot, preparation_marker):
+                            build_local_sdk_arch(
+                                project_dir,
+                                local_sdk_path,
+                                release,
+                                arch,
+                                build.target,
+                                build.snapshot,
+                                debug_build=args.debug,
+                                local_rpm_dirs=effective_local_rpm_dirs,
+                                snapshot_repositories=snapshot_repositories,
+                                snapshot_packages=snapshot_packages,
+                                no_vcs_apply=no_vcs_apply,
+                                allow_untrusted_rpms=args.allow_untrusted_rpms,
+                                spec=selected_spec,
+                                reset_snapshot=reset_snapshot,
+                                preparation_marker=preparation_marker,
+                                resume_snapshot=args.resume_snapshot,
+                            )
                 else:
                     build_arch(
                         project_dir,
@@ -2377,6 +2687,7 @@ def main(argv: list[str] | None = None) -> int:
                         local_rpm_dirs=effective_local_rpm_dirs,
                         no_vcs_apply=no_vcs_apply,
                         allow_untrusted_rpms=args.allow_untrusted_rpms,
+                        spec=selected_spec,
                     )
                 write_target_marker(project_dir, arch)
                 write_manifest(project_dir, generated_candidate_paths(project_dir))
@@ -2420,6 +2731,9 @@ def main(argv: list[str] | None = None) -> int:
                     started_at=started_at,
                     failure_class=failure_class,
                     failure_message=message,
+                    spec=selected_spec,
+                    snapshot_inputs=snapshot_recipe_data,
+                    provenance=build_provenance,
                 )
                 raise
 
@@ -2431,6 +2745,9 @@ def main(argv: list[str] | None = None) -> int:
             artifacts_dir=artifacts_dir,
             status="success",
             started_at=started_at,
+            spec=selected_spec,
+            snapshot_inputs=snapshot_recipe_data,
+            provenance=build_provenance,
         )
 
     if not args.quiet:

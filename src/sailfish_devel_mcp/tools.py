@@ -34,6 +34,45 @@ from .qml import ternary_translation_findings
 from .prerequisites import DEVICE_FEATURES, probe_report, probe_script, probe_tools, selected_features
 
 
+def _source_identity(root: Path) -> dict[str, Any]:
+    """Hash shipped source, including uncommitted changes, without invoking Git."""
+    files = {}
+    try:
+        for path in sorted(root.rglob("*.py")):
+            files[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        return {"sha256": None, "error": str(exc)}
+    digest = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+    return {"sha256": digest, "files": len(files)}
+
+
+_SOURCE_ROOT = Path(__file__).resolve().parent
+_HOST_LOADED_UTC = datetime.now(timezone.utc).isoformat()
+_STARTUP_SOURCE = _source_identity(_SOURCE_ROOT)
+
+
+def _process_started_utc() -> str | None:
+    try:
+        boot = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines()
+                    if line.startswith("btime "))
+        # comm can contain spaces and parentheses; fields after it start at 3.
+        fields = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()
+        started = boot + int(fields[19]) / os.sysconf("SC_CLK_TCK")
+        return datetime.fromtimestamp(started, timezone.utc).isoformat()
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+
+
+def _host_runtime_identity() -> dict[str, Any]:
+    current = _source_identity(_SOURCE_ROOT)
+    known = bool(_STARTUP_SOURCE.get("sha256") and current.get("sha256"))
+    return {"pid": os.getpid(), "process_started_utc": _process_started_utc(),
+            "loaded_utc": _HOST_LOADED_UTC,
+            "source_root": str(_SOURCE_ROOT), "startup_source": _STARTUP_SOURCE,
+            "disk_source": current,
+            "restart_needed": current["sha256"] != _STARTUP_SOURCE["sha256"] if known else None}
+
+
 ToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
 _BACKGROUND_SUPERVISORS: dict[int, subprocess.Popen[Any]] = {}
 OBSERVED_MCP_TRANSPORT_LIFETIME_SECONDS = 20
@@ -174,6 +213,8 @@ def build_registry(config: Config) -> dict[str, Tool]:
             lambda args: handle_qml_check_translator_ternaries(config, args),
         ),
     ]
+    from .companion_host import register as companion_tools
+    tools.extend(companion_tools(config))
     return {tool.spec["name"]: tool for tool in tools}
 
 
@@ -208,6 +249,35 @@ def _device_prerequisite_report(
 
 
 def handle_device_setup(config: Config, args: dict[str, Any]) -> dict[str, Any]:
+    from .companion_host import invoke
+    mode = args.get("companion", "none")
+    if mode not in ("none", "check", "deploy"):
+        raise ValueError("companion must be none, check or deploy")
+    approved = _bool_arg(args, "confirm_companion_install", default=False)
+    if approved and mode != "deploy":
+        raise ValueError("confirm_companion_install requires companion=deploy")
+    if mode != "none":
+        args = dict(args, features=list(dict.fromkeys(selected_features(args) + ["companion"])))
+    result = _handle_device_prerequisites(config, args)
+    report = result.get("structuredContent", {})
+    # Detached prerequisite workers re-enter this handler with wait=true.
+    if mode == "none" or result.get("isError") or "ready" not in report:
+        return result
+    if not report["ready"]:
+        return result
+    companion_result = invoke(config, "manage", {
+        **({"device": args["device"]} if "device" in args else {}),
+        "action": "deploy" if mode == "deploy" else "status",
+        "confirm_initial_install": approved,
+    }, allow_deploy=True)
+    report["companion"] = companion_result.get("structuredContent", {})
+    if companion_result.get("isError"):
+        report["companion_error"] = companion_result.get("content", [])
+        return tool_error("device prerequisites checked; companion operation failed", report)
+    return ok_text(json.dumps(report, indent=2, sort_keys=True), report)
+
+
+def _handle_device_prerequisites(config: Config, args: dict[str, Any]) -> dict[str, Any]:
     device = _device(config, args)
     features = selected_features(args)
     install_missing = _bool_arg(args, "install_missing", default=False)
@@ -256,11 +326,11 @@ def handle_device_journal(config: Config, args: dict[str, Any]) -> dict[str, Any
         command += ["-u", unit]
     if since:
         command += ["--since", since]
-    result = _run_ssh(config, device, command, timeout=timeout)
+    result = _run_device(config, device, command, timeout=timeout, extra={"filter": {"contains": grep}})
     stdout = result.stdout
     if grep:
         stdout = "\n".join(line for line in stdout.splitlines() if grep in line)
-        result = CommandResult(result.argv, result.returncode, stdout, result.stderr)
+        result = CommandResult(result.argv, result.returncode, stdout, result.stderr, result.metadata)
     return command_result("device journal", result)
 
 
@@ -273,11 +343,9 @@ def handle_device_topmost_pid(config: Config, args: dict[str, Any]) -> dict[str,
         "--print-reply",
         "--dest=org.nemomobile.lipstick",
         "/",
-        "org.freedesktop.DBus.Properties.Get",
-        "string:org.nemomobile.compositor",
-        "string:privateTopmostWindowProcessId",
+        "org.nemomobile.compositor.privateTopmostWindowProcessId",
     ]
-    result = _run_ssh(config, device, command, timeout=timeout)
+    result = _run_device(config, device, command, timeout=timeout, user=True)
     pid = _parse_dbus_integer(result.stdout)
     structured = result.summary_dict()
     structured["pid"] = pid
@@ -296,7 +364,10 @@ def handle_device_proc_maps(config: Config, args: dict[str, Any]) -> dict[str, A
     max_lines = _int_arg(args, "max_lines", default=200, minimum=1, maximum=5000)
     timeout = _int_arg(args, "timeout", default=20, minimum=1, maximum=120)
 
-    result = _run_ssh(config, device, ["cat", f"/proc/{pid}/maps"], timeout=timeout)
+    result = _run_device(config, device, ["cat", f"/proc/{pid}/maps"], timeout=timeout,
+                         extra={"filter": {"contains": contains, "max_lines": max_lines}})
+    if result.metadata.get("backend") == "companion":
+        return command_result("process maps", result, {"matched_lines": result.metadata["matched_lines"], "pid": pid})
     lines = result.stdout.splitlines()
     if contains:
         lines = [line for line in lines if contains in line]
@@ -304,8 +375,68 @@ def handle_device_proc_maps(config: Config, args: dict[str, Any]) -> dict[str, A
     stdout = "\n".join(limited)
     if len(lines) > max_lines:
         stdout += f"\n[truncated after {max_lines} lines]"
-    filtered = CommandResult(result.argv, result.returncode, stdout, result.stderr)
-    return command_result("process maps", filtered, {"matched_lines": len(lines), "pid": pid})
+    filtered = CommandResult(result.argv, result.returncode, stdout, result.stderr, result.metadata)
+    return command_result("process maps", filtered, {"matched_lines": result.metadata.get("matched_lines", len(lines)), "pid": pid})
+
+
+def _screenshot_plan(device, remote_path, privileged, timeout, name="screenshot"):
+    return [
+        {"name": name + "_prepare", "argv": ["sh", "-c", _screenshot_prepare_command(device, remote_path)], "timeout": timeout},
+        {"name": name, "argv": ["dbus-send", "--session", "--print-reply",
+            "--dest=org.nemomobile.lipstick", "/org/nemomobile/lipstick/screenshot",
+            "org.nemomobile.lipstick.saveScreenshot", "string:" + remote_path],
+         "user": True, "group": "privileged" if privileged else None, "timeout": timeout},
+    ]
+
+
+def _companion_touch_workflow(config, device, args, timeout):
+    from .companion_host import optional_call
+    privileged = _bool_arg(args, "privileged", default=True)
+    plans = []
+    screenshots = {}
+    for phase in ("before", "after"):
+        if not _bool_arg(args, "screenshot_" + phase, default=phase == "before"):
+            continue
+        remote = _optional_str(args, phase + "_remote_path") or _default_screenshot_path(device, "touch-" + phase)
+        local = _optional_str(args, phase + "_local_path")
+        if phase == "before":
+            local = local or _optional_str(args, "local_path")
+        local_path = _safe_output_path(config, local) if local else None
+        screenshots[phase] = (remote, local_path)
+    if "before" in screenshots:
+        plans.extend(_screenshot_plan(device, screenshots["before"][0], privileged, timeout, "screenshot_before"))
+    if _bool_arg(args, "discover_input", default=True) and not _optional_str(args, "input_device"):
+        plan, _ = _touch_plan({"action": "discover", "timeout": timeout,
+                              "include_evdev_trace": _bool_arg(args, "include_evdev_trace", default=False)})
+        plans.append(plan)
+    touch_plan, touch_data = _touch_plan(dict(args, timeout=timeout))
+    plans.append(touch_plan)
+    if "after" in screenshots:
+        plans.extend(_screenshot_plan(device, screenshots["after"][0], privileged, timeout, "screenshot_after"))
+    data = optional_call(config, device, "workflow", {"steps": plans, "timeout": timeout * len(plans)})
+    if data is None:
+        return None
+    results = []
+    for record in data["steps"]:
+        name = record["name"]
+        if name.endswith("_prepare") and record["returncode"] == 0:
+            continue
+        result = CommandResult(("device-companion", name), record["returncode"], record["stdout"], record["stderr"], {"backend": "companion"})
+        extra = dict(touch_data) if name == "touch" else {}
+        if name in ("screenshot_before", "screenshot_after"):
+            phase = name.removeprefix("screenshot_")
+            remote, local = screenshots[phase]
+            extra["remote_path"] = remote
+            if result.ok and local:
+                local.parent.mkdir(parents=True, exist_ok=True)
+                pull = run(scp_from_argv(device, config.paths.ssh_config, remote, local), timeout=timeout)
+                extra.update(local_path=str(local), pull=pull.summary_dict())
+                if not pull.ok:
+                    # Device side effects already happened. Never rerun the workflow.
+                    results.append((name, command_result("pull screenshot (device workflow already executed)", pull, extra)))
+                    return combined_result("touch workflow", results)
+        results.append((name, command_result(name, result, extra)))
+    return combined_result("touch workflow", results)
 
 
 def handle_device_lipstick_screenshot(config: Config, args: dict[str, Any]) -> dict[str, Any]:
@@ -334,7 +465,10 @@ def handle_device_lipstick_screenshot(config: Config, args: dict[str, Any]) -> d
     prepare_dir = _screenshot_prepare_command(device, remote_path)
     dbus_call = f"sg privileged -c {shlex.quote(inner)}" if privileged else inner
     remote = f"{prepare_dir} && {dbus_call}"
-    result = run(ssh_argv(device, config.paths.ssh_config, remote), timeout=timeout)
+    from .companion_host import routed
+    plan = _screenshot_plan(device, remote_path, privileged, timeout)
+    result = routed(config, device, ["sh", "-c", remote], timeout=timeout,
+                    fallback=remote, steps=plan)
 
     structured: dict[str, Any] = result.summary_dict()
     structured["remote_path"] = remote_path
@@ -352,21 +486,18 @@ def handle_device_lipstick_screenshot(config: Config, args: dict[str, Any]) -> d
     return command_result("lipstick screenshot", result, structured)
 
 
-def handle_device_touch(config: Config, args: dict[str, Any]) -> dict[str, Any]:
-    device = _device(config, args)
+def _touch_plan(args):
     action = _enum_arg(args, "action", ["discover", "tap", "swipe"])
     timeout = _int_arg(args, "timeout", default=10, minimum=1, maximum=120)
     input_device = _optional_str(args, "input_device")
     if input_device and not re.fullmatch(r"/dev/input/event\d+", input_device):
-        return tool_error("input_device must look like /dev/input/event<N>")
+        raise ValueError("input_device must look like /dev/input/event<N>")
 
     if action == "discover":
         include_evdev_trace = _bool_arg(args, "include_evdev_trace", default=False)
         remote = _touch_discover_command(include_evdev_trace)
-        return command_result(
-            "touchscreen discovery",
-            run(ssh_argv(device, config.paths.ssh_config, remote), timeout=timeout),
-        )
+        return {"name": "touchscreen_discovery", "argv": ["sh", "-c", remote], "timeout": timeout}, {}
+
 
     values: dict[str, str | int] = {"ACTION": action}
     if input_device:
@@ -389,11 +520,19 @@ def handle_device_touch(config: Config, args: dict[str, Any]) -> dict[str, Any]:
         "action": action,
         "input_device": input_device,
     }
-    return command_result(
-        "device touch",
-        run(ssh_argv(device, config.paths.ssh_config, remote), timeout=timeout),
-        structured,
-    )
+    return {"name": "touch", "argv": ["sh", "-c", remote], "timeout": timeout}, structured
+
+
+def handle_device_touch(config: Config, args: dict[str, Any]) -> dict[str, Any]:
+    device = _device(config, args)
+    try:
+        plan, structured = _touch_plan(args)
+    except ValueError as exc:
+        if str(exc).startswith("input_device must"):
+            return tool_error(str(exc))
+        raise
+    result = _run_device(config, device, plan["argv"], timeout=plan["timeout"])
+    return command_result("touchscreen discovery" if plan["name"] == "touchscreen_discovery" else "device touch", result, structured)
 
 
 def handle_device_touch_workflow(config: Config, args: dict[str, Any]) -> dict[str, Any]:
@@ -404,6 +543,10 @@ def handle_device_touch_workflow(config: Config, args: dict[str, Any]) -> dict[s
     screenshot_after = _bool_arg(args, "screenshot_after", default=False)
     discover_input = _bool_arg(args, "discover_input", default=True)
     privileged = _bool_arg(args, "privileged", default=True)
+
+    companion_result = _companion_touch_workflow(config, device, args, timeout)
+    if companion_result is not None:
+        return companion_result
 
     steps: list[tuple[str, dict[str, Any]]] = []
     base_args = {"device": _optional_str(args, "device") or device.name, "timeout": timeout}
@@ -475,7 +618,7 @@ def handle_device_user_bus_call(config: Config, args: dict[str, Any]) -> dict[st
         f"{interface}.{member}",
         *dbus_args,
     ]
-    return command_result("user bus call", _run_ssh(config, device, command, timeout=timeout))
+    return command_result("user bus call", _run_device(config, device, command, timeout=timeout, user=True))
 
 
 def handle_device_user_session_command(config: Config, args: dict[str, Any]) -> dict[str, Any]:
@@ -489,13 +632,10 @@ def handle_device_user_session_command(config: Config, args: dict[str, Any]) -> 
         maximum=MAX_MCP_WAIT_SECONDS,
     )
     run_as_user = _bool_arg(args, "run_as_user", default=False)
-    if run_as_user:
-        result = run(
-            _device_user_session_argv(config, device, command, run_as_user=True),
-            timeout=timeout,
-        )
-    else:
-        result = _run_ssh(config, device, user_bus_env(device) + command, timeout=timeout)
+    from .companion_host import routed
+    result = routed(config, device, user_bus_env(device) + command, timeout=timeout,
+                    user=run_as_user,
+                    fallback=_device_user_session_argv(config, device, command, run_as_user=run_as_user)[-1])
     return command_result(
         "user session command",
         result,
@@ -509,6 +649,10 @@ def handle_device_command_start(config: Config, args: dict[str, Any]) -> dict[st
     command = _command_list_arg(args, "command")
     timeout = _int_arg(args, "timeout", default=3600, minimum=1, maximum=86400)
     run_as_user = _bool_arg(args, "run_as_user", default=False)
+    from .companion_host import start_job
+    companion_result = start_job(config, device, dict(args, command=command, timeout=timeout, run_as_user=run_as_user))
+    if companion_result is not None:
+        return companion_result
     argv = _device_user_session_argv(
         config,
         device,
@@ -579,6 +723,10 @@ def handle_device_command_status(config: Config, args: dict[str, Any]) -> dict[s
             {"jobs_dir": str(jobs_dir), "jobs": jobs},
         )
 
+    from .companion_host import job_operation
+    companion_result = job_operation(config, args)
+    if companion_result is not None:
+        return companion_result
     _validate_local_job_id(job_id)
     job_dir = _local_job_dir(jobs_dir, job_id)
     status_path = job_dir / "status.json"
@@ -654,6 +802,10 @@ def handle_device_command_status(config: Config, args: dict[str, Any]) -> dict[s
 def handle_device_command_cancel(config: Config, args: dict[str, Any]) -> dict[str, Any]:
     job_id = _str_arg(args, "job_id")
     _validate_local_job_id(job_id)
+    from .companion_host import job_operation
+    companion_result = job_operation(config, args, cancel=True)
+    if companion_result is not None:
+        return companion_result
     job_dir = _local_job_dir(_device_command_jobs_dir(), job_id)
     status = _read_job_status(job_dir / "status.json")
     if status is None:
@@ -769,9 +921,12 @@ def handle_device_restart_service(config: Config, args: dict[str, Any]) -> dict[
         command = user_bus_env(device) + ["systemctl", "--user", action, unit]
     else:
         command = ["systemctl", action, unit]
+    if unit == "sailfish-devel-companion.service" and mode == "system":
+        return command_result(f"{mode} service {action}", _run_ssh(config, device, command, timeout=timeout))
     return command_result(
         f"{mode} service {action}",
-        _run_ssh(config, device, command, timeout=timeout),
+        _run_device(config, device, command, timeout=timeout, user=mode == "user",
+                    extra={"service": {"unit": unit, "mode": mode}}),
     )
 
 
@@ -790,15 +945,11 @@ def handle_device_app_launch(config: Config, args: dict[str, Any]) -> dict[str, 
     timeout = _int_arg(args, "timeout", default=15, minimum=1, maximum=15)
     if timeout <= wait_seconds:
         raise ValueError("timeout must exceed wait_seconds")
-    result = run(
-        _device_user_session_argv(
-            config, device,
-            ["sh", "-c", _app_launch_script(), "app-launch",
-             device.username, desktop_file, str(wait_seconds)],
-            run_as_user=True,
-        ),
-        timeout=timeout,
-    )
+    from .companion_host import routed
+    launch_command = ["sh", "-c", _app_launch_script(), "app-launch", device.username, desktop_file, str(wait_seconds)]
+    result = routed(config, device, launch_command[:-1] + ["0"], timeout=timeout, user=True,
+                    extra={"foreground": desktop_file, "foreground_wait": wait_seconds},
+                    fallback=_device_user_session_argv(config, device, launch_command, run_as_user=True)[-1])
     receipt = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
     launch_pid = receipt.get("launch_pid", "")
     exit_code = receipt.get("launch_exit_code", "")
@@ -861,7 +1012,8 @@ def handle_device_browser_launch(config: Config, args: dict[str, Any]) -> dict[s
     wait_seconds = _int_arg(args, "wait_seconds", default=3, minimum=0, maximum=60)
     timeout = _int_arg(args, "timeout", default=60, minimum=1, maximum=300)
     remote = _browser_launch_command(device, url, stop_stale, wait_seconds)
-    result = run(ssh_argv(device, config.paths.ssh_config, remote), timeout=timeout)
+    result = _run_device(config, device, ["sh", "-c", remote], timeout=timeout)
+
     return command_result(
         "browser launch",
         result,
@@ -882,6 +1034,9 @@ def _sailfish_build_command(
         raise ValueError(f"build helper not found: {script}")
 
     command = ["python3", str(script), "--project-dir", str(project_path)]
+    spec_path = _optional_str(args, "spec_path")
+    if spec_path:
+        command += ["--spec", spec_path]
     backend = _enum_arg(args, "backend", ["auto", "docker", "local"], default="auto")
     command += ["--backend", backend]
     release = _optional_str(args, "release") or (device.release if device else None)
@@ -898,7 +1053,11 @@ def _sailfish_build_command(
     snapshot_key = _optional_str(args, "snapshot_key")
     snapshot_repositories = _string_list_arg(args, "snapshot_repository")
     snapshot_packages = _string_list_arg(args, "snapshot_package")
-    if (snapshot_key or snapshot_repositories or snapshot_packages) and backend == "docker":
+    reset_snapshot = _bool_arg(args, "reset_snapshot", default=False)
+    resume_snapshot = _bool_arg(args, "resume_snapshot", default=False)
+    if reset_snapshot and resume_snapshot:
+        raise ValueError("reset_snapshot and resume_snapshot are mutually exclusive")
+    if (snapshot_key or snapshot_repositories or snapshot_packages or reset_snapshot or resume_snapshot) and backend == "docker":
         raise ValueError("snapshot options require the local backend")
     if backend != "docker":
         if local_sdk:
@@ -907,6 +1066,10 @@ def _sailfish_build_command(
             release = "live"
         if snapshot_key:
             command += ["--snapshot-key", snapshot_key]
+        if reset_snapshot:
+            command.append("--reset-snapshot")
+        if resume_snapshot:
+            command.append("--resume-snapshot")
         for repository in snapshot_repositories:
             command += ["--snapshot-repository", repository]
         for package in snapshot_packages:
@@ -1472,6 +1635,8 @@ def _job_is_terminal(status: dict[str, Any]) -> bool:
 
 
 def _with_supervisor_health(status: dict[str, Any], job_dir: Path | None = None) -> dict[str, Any]:
+    if status.get("backend") == "companion":
+        return status
     if _job_is_terminal(status):
         return status
     pid = status.get("supervisor_pid")
@@ -1819,7 +1984,7 @@ def _compact_build_status(status: dict[str, Any]) -> dict[str, Any]:
               "failure_class", "failure_message", "artifacts", "device_setup", "result_path")
     data = {field: status[field] for field in fields if field in status}
     metadata = status.get("build_metadata") or {}
-    for key in ("helper_version", "backend", "release", "duration_seconds", "rpmlint"):
+    for key in ("helper_version", "backend", "release", "duration_seconds", "rpmlint", "provenance", "artifact_checksums"):
         if key in metadata:
             data[key] = metadata[key]
     if metadata.get("builds"):
@@ -1831,7 +1996,7 @@ def _compact_build_status(status: dict[str, Any]) -> dict[str, Any]:
 
 def _compact_device_command_status(status: dict[str, Any]) -> dict[str, Any]:
     fields = ("job_id", "job_kind", "device", "state", "returncode", "log_path",
-              "status_path", "failure_class", "failure_message")
+              "status_path", "failure_class", "failure_message", "backend", "remote_log_path", "remote_status_path")
     return {field: status[field] for field in fields if field in status}
 
 
@@ -1915,6 +2080,7 @@ def handle_doctor(config: Config, args: dict[str, Any]) -> dict[str, Any]:
     manifest_path = Path(build_sailfishos.__file__).with_name("build-helper.json")
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     digest = hashlib.sha256(helper.read_bytes()).hexdigest() if helper.is_file() else None
+    report["host_runtime"] = _host_runtime_identity()
     report.update(helper_exists=helper.is_file(), helper_matches_vendor=digest == manifest.get("sha256"),
                   configured_helper=str(helper), vendored_source=manifest,
                   device_count=len(config.devices), android_host_count=len(config.android_build_hosts),
@@ -2160,6 +2326,12 @@ def handle_qml_check_translator_ternaries(config: Config, args: dict[str, Any]) 
         "structuredContent": {"path": str(path), "findings": findings},
         "isError": True,
     }
+
+
+def _run_device(config, device, command, *, timeout, user=False, extra=None):
+    from .companion_host import routed
+    return routed(config, device, command, timeout=timeout, user=user, extra=extra,
+                  fallback=remote_command(command))
 
 
 def _run_ssh(
@@ -2625,10 +2797,8 @@ fi
 reply=$(dbus-send --session --print-reply \\
     --dest=org.nemomobile.lipstick \\
     / \\
-    org.freedesktop.DBus.Properties.Get \\
-    string:org.nemomobile.compositor \\
-    string:privateTopmostWindowProcessId 2>/dev/null || true)
-topmost_pid=$(printf '%s\\n' "$reply" | awk '/\\b(int32|uint32|int64|uint64)\\b/ {{ print $2; exit }}')
+    org.nemomobile.compositor.privateTopmostWindowProcessId 2>/dev/null || true)
+topmost_pid=$(printf '%s\\n' "$reply" | awk '$1 ~ /^(int32|uint32|int64|uint64)$/ {{ print $2; exit }}')
 if [ -n "$topmost_pid" ]; then
     echo "topmost_pid=$topmost_pid"
     if [ -r "/proc/$topmost_pid/maps" ]; then
@@ -2657,7 +2827,7 @@ def _local_sdk_path(config: Config, args: dict[str, Any]) -> Path | None:
 def _local_sdk_target(config: Config, args: dict[str, Any], local_sdk: Path) -> str | None:
     explicit_target = _optional_str(args, "target")
     if explicit_target:
-        return build_sailfishos.canonical_local_target_name(explicit_target)
+        return explicit_target
 
     device = config.device(_optional_str(args, "device")) if args.get("device") else None
     arch = _optional_str(args, "arch") or (device.architecture if device else "")
@@ -3263,13 +3433,21 @@ def _spec_device_setup() -> dict[str, Any]:
         "description": (
             "Check command availability and session configuration over SSH. By default this only reads device state. "
             "Explicit install_missing=true installs missing python3-base or mce-tools from existing repositories "
-            "in a detached job; use sailfish_build_status/cancel. Missing base OS tools need manual repair."
+            "in a detached job; use sailfish_build_status/cancel. Missing base OS tools need manual repair. "
+            "Set companion=check to inspect the optional device companion or deploy to install/update and start it. "
+            "Before requesting first-install permission, warn: development/test devices only; do not install on personal or primary phones "
+            "containing real accounts or sensitive data. Captures may expose private application/account data to the host MCP client and model context. "
+            "ALWAYS ask permission before its first installation on each device; only then set confirm_companion_install=true. "
+            "Updates to recognized installations need no new permission. Deployment resets capture history."
         ),
         "inputSchema": _object_schema({
             "device": _device_prop(),
             "features": {"type": "array", "minItems": 1,
                          "items": {"type": "string", "enum": list(DEVICE_FEATURES)}},
             "install_missing": {"type": "boolean", "default": False},
+            "companion": {"type": "string", "enum": ["none", "check", "deploy"], "default": "none"},
+            "confirm_companion_install": {"type": "boolean", "default": False,
+                "description": "True only after presenting the personal-device/data-exposure warning and receiving explicit permission for first companion installation on this device. Not needed for updates."},
             "wait": {"type": "boolean", "default": False,
                      "description": "Wait for installation; use the default detached job for long work."},
             "timeout": {"type": "integer", "minimum": 1, "maximum": 1200, "default": 600},
@@ -3518,7 +3696,7 @@ def _spec_device_command_start() -> dict[str, Any]:
         "name": "sailfish_device_command_start",
         "title": "Start Device Command Job",
         "description": (
-            "Start a detached SSH command with the configured Sailfish user-session "
+            "Prefer a device-companion job, with detached SSH fallback when unavailable, using the configured Sailfish user-session "
             "environment and immediately return a job id. Use this for GDB, tracing, "
             f"and any device command that may exceed {MAX_MCP_WAIT_SECONDS} seconds."
         ),
@@ -3705,6 +3883,18 @@ def _spec_build_rpm() -> dict[str, Any]:
         "inputSchema": _object_schema(
             {
                 "project_path": {"type": "string"},
+                "spec_path": {
+                    "type": "string",
+                    "description": "RPM spec relative to the resolved project root; required when multiple specs exist.",
+                },
+                "reset_snapshot": {
+                    "type": "boolean", "default": False,
+                    "description": "Deliberately reset the managed project snapshot and reapply its dependency inputs. Never resets a base target.",
+                },
+                "resume_snapshot": {
+                    "type": "boolean", "default": False,
+                    "description": "Explicitly reapply an existing snapshot's identical recorded recipe without resetting. Unknown or different recipes are rejected.",
+                },
                 "device": {
                     "type": "string",
                     "description": "Optional configured device to supply default release and architecture.",
@@ -3999,7 +4189,7 @@ def _spec_sdk_refresh_metadata() -> dict[str, Any]:
                 },
                 "target": {
                     "type": "string",
-                    "description": "Local SDK target base or .default target, for example aarch64 or aarch64.default.",
+                    "description": "Exact SDK target to refresh: aarch64 means the parent, aarch64.default or aarch64-project means that specific snapshot. No implicit suffix is added.",
                 },
                 "release": {"type": "string"},
                 "arch": {"type": "string"},

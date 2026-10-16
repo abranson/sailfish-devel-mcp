@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import shlex
 import subprocess
@@ -31,6 +31,7 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -41,6 +42,7 @@ class CommandResult:
         stderr, stderr_truncated = truncate(self.stderr, limit)
         return {
             "argv": list(self.argv),
+            **self.metadata,
             "returncode": self.returncode,
             "stdout": stdout,
             "stderr": stderr,
@@ -55,6 +57,7 @@ class CommandResult:
         stderr_limit: int = 2000,
     ) -> dict[str, object]:
         return {
+            **self.metadata,
             "returncode": self.returncode,
             "stdout_chars": len(self.stdout),
             "stderr_chars": len(self.stderr),

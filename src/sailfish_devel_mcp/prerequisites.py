@@ -6,6 +6,7 @@ from typing import Any
 
 # Each tuple is a requirement; multiple entries are acceptable alternatives.
 DEVICE_FEATURES = {
+    "companion": (("python3",), ("systemctl",), ("getent",), ("env",), ("runuser", "su")),
     "commands": (("sh",), ("env",)),
     "diagnostics": (("journalctl",), ("cat",), ("dbus-send",), ("env",)),
     "screenshot": (("dbus-send",), ("env",), ("sg",), ("stat",),
@@ -26,7 +27,7 @@ DEFAULT_DEVICE_FEATURES = (
 )
 # Base OS packages and applications are deliberately left to manual repair.
 DEVICE_SETUP_PACKAGES = {"python3": "python3-base", "evdev_trace": "mce-tools"}
-SESSION_FEATURES = {"diagnostics", "screenshot", "app_launch", "browser"}
+SESSION_FEATURES = {"diagnostics", "screenshot", "app_launch", "browser", "companion"}
 
 
 def selected_features(args: dict[str, Any]) -> list[str]:
@@ -88,10 +89,12 @@ def probe_report(features: list[str], stdout: str) -> dict[str, Any]:
         for feature in features
     }
     missing = sorted({tool for requirements in missing_by_feature.values() for tool in requirements})
-    if "touch" in features and tools["python3"] and values.get("python3_compatible") != "1":
+    if ("touch" in features or "companion" in features) and tools["python3"] and values.get("python3_compatible") != "1":
         requirement = "Python >=3.6 with os, re, struct, sys and time modules"
         missing.append(requirement)
-        missing_by_feature["touch"].append(requirement)
+        for feature in ("touch", "companion"):
+            if feature in features:
+                missing_by_feature[feature].append(requirement)
     packages = sorted({DEVICE_SETUP_PACKAGES[tool] for tool in missing
                        if tool in DEVICE_SETUP_PACKAGES})
     session_needed = bool(SESSION_FEATURES.intersection(features))

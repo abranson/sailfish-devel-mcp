@@ -308,6 +308,23 @@ class BuildJobTests(unittest.TestCase):
         self.assertIn("--allow-untrusted-rpms", command)
         self.assertEqual(command[-2:], ["--dry-run", "--json"])
 
+    def test_build_command_exposes_explicit_resume_without_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.make_config(root)
+            config.paths.build_sailfishos.touch()
+            (root / "rpm").mkdir()
+            (root / "rpm" / "example.spec").write_text("Name: example\n")
+            args = {"project_path": str(root), "backend": "local",
+                    "snapshot_key": "email", "resume_snapshot": True}
+            command, _ = tools._sailfish_build_command(config, args)
+            self.assertIn("--resume-snapshot", command)
+            self.assertNotIn("--reset-snapshot", command)
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                tools._sailfish_build_command(config, {**args, "reset_snapshot": True})
+            with self.assertRaisesRegex(ValueError, "local backend"):
+                tools._sailfish_build_command(config, {**args, "backend": "docker"})
+
     def test_build_command_uses_quiet_output_for_real_builds(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -433,7 +450,7 @@ class BuildJobTests(unittest.TestCase):
         self.assertIn('kill -TERM -"$pid"', cancel)
 
     def test_vendored_helper_has_versioned_interface(self):
-        self.assertEqual(build_sailfishos.HELPER_VERSION, "2.4.4")
+        self.assertEqual(build_sailfishos.HELPER_VERSION, "2.5.1")
         args = build_sailfishos.parse_args(
             [
                 "--backend",

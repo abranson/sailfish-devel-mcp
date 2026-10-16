@@ -152,6 +152,126 @@ status includes the final report under `device_setup` and its JSON `result_path`
 cancellation, but interrupting SSH does not roll back a package transaction.
 `wait=true` requests synchronous operation for controlled diagnostics.
 
+## Optional device companion
+
+**Development/test devices only. Do not install this companion on a personal
+or primary phone containing real accounts or sensitive data.** It runs as root
+and can execute privileged development commands. Journal/D-Bus captures, screenshots
+and diagnostics can include private data returned to the host MCP client and model
+context. Present this warning before requesting first-install permission.
+
+The host MCP remains the coordinator for builds, OBS, repository work and file
+transfers. The optional Python 3.6+ standard-library companion runs as a **system
+service**, with a root-only Unix socket reached over existing SSH access. It has
+no TCP listener. Session D-Bus calls, app launches and user-service operations run
+as the configured graphical user with that user's home and bus environment.
+
+Use `sailfish_device_setup` for installation and updates:
+
+```json
+{"device": "phone", "features": ["companion"], "companion": "check"}
+```
+
+Always request permission before first installation on each device. Only after
+approval, deploy with:
+
+```json
+{"device": "phone", "features": ["companion"], "companion": "deploy", "confirm_companion_install": true}
+```
+
+Updates to recognized installations need no renewed permission; omit the
+confirmation flag. A recognized earlier user-service installation is migrated:
+setup verifies root-service readiness before stopping/removing the old user
+service. User-owned companion source is never executed as root during migration.
+Unknown files/symlinks are refused. The confirmation flag records the caller's
+assertion of approval, not an independent authentication mechanism.
+
+Deployment requires root SSH and writes:
+
+- `/opt/sailfish-devel-companion/{agent.py,owner,session.json}`
+- `/etc/systemd/system/sailfish-devel-companion.service`
+- Runtime socket/lock in `/run/sailfish-devel-companion/`, with a separate
+  `/run/sailfish-devel-companion.control` lifecycle lock.
+- Detached job state/logs under `/var/lib/sailfish-devel-companion/jobs/`.
+
+Code, configuration, socket and job directories are private to root. Setup starts
+or restarts the service and returns the deployed source SHA-256. It does not enable
+boot autostart or start capture. An installed companion starts on demand for
+routed device work or a new capture. It exits successfully after **one hour of
+inactivity**, so systemd does not restart it. Active requests and detached jobs
+prevent idle shutdown and reset the idle period. Capture output does not count
+as activity; each capture expires after **one hour**, even if clients keep polling.
+Restart capture explicitly for a longer session. Idle shutdown discards the
+in-memory event history; detached job records remain on disk.
+
+Management `stop` pauses on-demand startup persistently; `start` or a deployment
+update resumes it. Status inspection does not start a stopped service. A failed
+on-demand start selects SSH fallback before any requested operation executes.
+The system service is independent of the graphical
+session; session-dependent tools still require that session to be available.
+Optional Python installation still requires `install_missing=true`. Ordinary
+setup defaults perform no installation. Setup, recovery and RPM transfer/install
+retain their host implementations and do not depend on a working companion.
+
+### Existing device tools and fallback
+
+Public host tool names and arguments are preserved. Journal reads, process maps,
+topmost PID, D-Bus calls, short commands, screenshots/touch, app/browser launch,
+service control and detached device commands prefer a compatible companion.
+Absent, incompatible or explicitly paused companions select the retained SSH implementation
+**before execution**. A protocol/transport error or failed operation after selecting
+the companion is reported, never retried over SSH. No automatic installation occurs.
+Root-only socket access does not elevate a non-root SSH account; it uses fallback.
+
+Journal/process-map filtering runs on the device. Screenshot/touch workflows run
+under one device-local operation lock; file downloads remain host-side and happen
+after the device sequence. A download failure does not replay already-performed
+touch input. App launch adds observed foreground PID/verification where the desktop
+entry's executable can be identified; submission alone still does not prove visible
+rendering. Service calls include local state and bounded failure logs. Operations
+that start/stop the companion itself use SSH to avoid severing their own RPC.
+
+Detached commands run under device-owned supervisors, survive host/SSH disconnects,
+and terminate their process groups on cancellation/timeout, including children
+whose leader has exited. Durable host receipts keep the existing job ID and
+status/cancel/CLI interface. Individual status reads contact the recorded device;
+listings show the last known snapshot. Jobs never switch backend after submission.
+Logs stay on the device and are retrieved in bounded pages/excerpts. Restart/reboot
+interruption is reported as a lost supervisor, not success. Managed stop, remove
+and update refuse while jobs are active; job submission and management share a
+lock. Completed job evidence is retained on companion removal.
+
+### Capture tools
+
+All tools below have the prefix `sailfish_device_companion_`:
+
+| Suffix | Purpose |
+| --- | --- |
+| `manage` | Inspect installation or start/stop/remove the service |
+| `status` | Running version, API capabilities, UID, session user and capture state |
+| `capture_start` | One journal unit (`source=journal`, `unit=example.service`, `scope=user/system`, default user), or D-Bus interface (`source=dbus`, `interface=org.example.Interface`, `bus=session/system`) |
+| `capture_stop` | Stop collection, retaining captured history |
+| `events` | Read `instance`/`after` cursor pages, `limit` 1–100, optional `wait_seconds` 0–10 |
+| `wait_service` | Wait for `unit` to reach `active/inactive/failed`, `scope=user/system`, up to ten seconds |
+
+Root journal capture reads system storage directly; user scope filters by the
+configured user's UID and user unit, so it works even without separate per-user
+journal files. Session D-Bus capture drops to the graphical user. Capture is off
+initially; a second capture is refused until the first is stopped. D-Bus output
+is raw text lines. Inspect status/events for command failures and policy denials.
+
+History is capped at 512 records of at most 4096 characters each. It survives SSH
+disconnects, but not companion restart/update or reboot. Save `instance` and
+`next_after`; `reset` reports a new instance and `dropped` reports overflow. Pages
+are also bounded to 64 KiB of record text. Synchronous command output is bounded
+to 2 MiB per stream, with truncation reported; detached logs remain complete.
+
+For a direct MCP client, execute `/opt/sailfish-devel-companion/agent.py --stdio`
+as root over SSH. It bridges the five public companion MCP tools to the existing
+service. Internal execution/job RPCs are private to the root socket and support
+the existing host tools. Removal deletes only recognized installation files,
+stops capture, and preserves unexpected files and completed job evidence.
+
 ## Trust and privacy
 
 This is local development tooling intended for a trusted MCP client running on
@@ -323,7 +443,8 @@ stderr are needed. This synchronous tool is limited to 15 seconds.
 Use `sailfish_device_command_start` for GDB, tracing, or any command that might
 run longer than 15 seconds. It starts a detached host-side SSH process and
 returns a job id immediately, so the command survives the MCP request and stdio
-server exiting. Use the CLI waiter below for long waits. For occasional checks, use
+server exiting. Use scheduled follow-ups for long jobs, or the CLI waiter below
+when explicitly waiting. For occasional checks, use
 `sailfish_device_command_status` with `lines=0` and at most 15 `wait_seconds`. Terminal
 failures include a bounded log excerpt automatically. Full logs remain under
 the local MCP state directory in `device-commands/<job-id>/command.log`. Use
@@ -385,10 +506,11 @@ not silently fall back to Docker. Asynchronous jobs use confined UUID job
 directories and expose helper metadata and RPM paths through
 `sailfish_build_status`; use `sailfish_build_cancel` to terminate the tracked
 process group. Successful builds run the helper in quiet mode while retaining
-the complete job log. Let `sailfish_build_status` wait mechanically with
-`wait_seconds` and leave `lines` at `0` during routine monitoring. A terminal
-failure automatically includes a bounded diagnostic excerpt; request log lines
-or `verbose` output only when more detail is needed. Status waits are capped at
+the complete job log. For occasional status checks, use `lines=0` and
+`after_revision` to suppress unchanged output. Scheduled progress checks need
+bounded log evidence to choose the next interval; follow the long-job policy
+below instead of repeatedly calling short status waits. A terminal failure
+includes a bounded diagnostic excerpt; request more only when needed. Status waits are capped at
 15 seconds so a monitoring request stays comfortably below the stdio
 transport's observed lifetime limit.
 
@@ -411,13 +533,15 @@ used to launch the job can disconnect without killing the build. Set
 `sailfish_android_build_status`; omit `job_id` to list recent jobs, or pass a
 job id and `wait_seconds` to wait mechanically for a state change. Running jobs
 omit their log by default, while failed jobs include a bounded diagnostic
-excerpt. Set `lines` or `verbose` only for explicit log or command inspection.
+excerpt. Request bounded `lines` during scheduled progress checks; use
+`verbose` only when full command/job inspection is needed.
 Individual status waits are capped at 15 seconds. Use
 `sailfish_android_build_cancel` to terminate the identity-checked process group.
 
 `sailfish_sdk_refresh_metadata` starts a detached job to refresh zypper metadata in the installed SDK
-main target, for example `aarch64.default`, using the same privileged Docker
-wrapper style as local SDK builds. Use it when local SDK builds fail because a
+exact requested target using the same privileged Docker wrapper as local builds.
+`aarch64` refreshes the parent; `aarch64.default` or `aarch64-project` refreshes
+that specific snapshot. No `.default` suffix is inferred. Use it when local SDK builds fail because a
 package listed in repository metadata cannot be downloaded.
 
 `sailfish_obs_results` and `sailfish_obs_buildlog` accept a friendly `server`
@@ -475,7 +599,11 @@ transaction. Inspect package state before retrying an interrupted install.
 `sailfish_obs_watch` runs `osc results --watch --fail-on-error` in a detached job,
 using the selected OBS alias and package filter. It does not modify OBS sources.
 
-For long jobs use one CLI process, without repeated model-driven status calls:
+For long jobs, confirm detached startup and arrange a quiet scheduled follow-up
+unless the user opts out, then return to the user. Each follow-up should inspect bounded progress evidence
+and notify once on completion or failure. If scheduling is unavailable, report
+that limitation. When the user explicitly requests waiting, use one CLI process
+without repeated model-driven status calls:
 
 ```sh
 bin/sailfish-devel-jobs wait --kind build --job-id JOB_ID
@@ -520,3 +648,26 @@ the canonical skill first, vendor it, and run both test suites before release.
 `skills/sailfish-devel` is a separate optional skill for deployment, debugging,
 Android and OBS workflows. Install/symlink that directory in your skill directory;
 the canonical RPM skill stays focused on building and packaging.
+
+### Detecting a stale host process
+
+`sailfish_doctor` includes `host_runtime`: the PID, process start time (when
+available), source-load time, and SHA-256 identities of package Python sources
+at startup and currently on disk. `restart_needed: true` means the source tree
+changed after startup; restart the MCP connection before relying on the updated
+implementation. `null` means identity could not be checked. This is separate
+from the existing canonical/vendored helper integrity check and does not restart
+the server or interrupt jobs automatically.
+
+### Build input provenance
+
+Use `spec_path` in build/preflight requests to choose a repository's RPM spec,
+for example `rpm/sensorfw-qt5.spec`. Ambiguous selection reports candidates.
+Managed snapshots track dependency inputs, including local RPM hashes. Use
+`reset_snapshot: true` when deliberately resetting a project's snapshot to
+reapply changed inputs; SDK bases remain untouched. Build results include
+`provenance` and `artifact_checksums` for tracing RPMs back to source and inputs.
+After interrupted preparation, `resume_snapshot: true` explicitly retries the
+identical recorded inputs without resetting an existing snapshot. Missing or
+different recipes remain rejected. A build failure after preparation retains
+the completed recipe, so it does not by itself require a reset.

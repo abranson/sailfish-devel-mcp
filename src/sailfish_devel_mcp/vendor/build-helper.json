@@ -1,7 +1,7 @@
 {
-  "helper_version": "2.4.4",
-  "sha256": "b564395cd1a3bcb78c787b9375f4af0868241d3737aa7ac015974796e4106796",
+  "helper_version": "2.5.1",
+  "sha256": "1c108f6d1190009ddb5e88dec2d47fcacf3b9375b8c67b5a50c1fb3e9e9eba6e",
   "source": "build-sailfishos-skill/scripts/build_sailfishos.py",
   "source_dirty": false,
-  "source_revision": "57ad5cb2710ed41c14c2fd5b2f2942f32a5131fb"
+  "source_revision": "10407b47fabed8fb8c8f4fddd84b6c464dccca10"
 }

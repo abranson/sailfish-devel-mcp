@@ -263,7 +263,7 @@ class McpServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             server = self.make_server(Path(tmp))
             output = "x" * 10000
-            with patch("sailfish_devel_mcp.tools._run_ssh") as mocked_run:
+            with patch("sailfish_devel_mcp.companion_host.routed") as mocked_run:
                 mocked_run.return_value = CommandResult(("ssh", "large-command"), 0, output, "")
                 response = server.handle(
                     {
@@ -298,7 +298,7 @@ class McpServerTests(unittest.TestCase):
     def test_user_session_command_timeout_returns_error_and_server_recovers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             server = self.make_server(Path(tmp))
-            with patch("sailfish_devel_mcp.tools._run_ssh") as mocked_run:
+            with patch("sailfish_devel_mcp.companion_host.routed") as mocked_run:
                 mocked_run.return_value = CommandResult(
                     ("ssh", "root@test"),
                     124,
@@ -683,7 +683,7 @@ class McpServerTests(unittest.TestCase):
     def test_device_touch_workflow_screenshots_discovers_and_taps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             server = self.make_server(Path(tmp))
-            with patch("sailfish_devel_mcp.tools.run") as mocked_run:
+            with patch("sailfish_devel_mcp.companion_host.optional_call", return_value=None), patch("sailfish_devel_mcp.tools.run") as mocked_run:
                 mocked_run.side_effect = [
                     CommandResult(("ssh", "root@test"), 0, "screenshot\n", ""),
                     CommandResult(("ssh", "root@test"), 0, "inputs\n", ""),
@@ -748,6 +748,7 @@ class McpServerTests(unittest.TestCase):
                     {"SAILFISH_DEVEL_MCP_STATE_DIR": str(state)},
                 ),
                 patch("sailfish_devel_mcp.tools._start_background_command") as mocked_start,
+                patch("sailfish_devel_mcp.companion_host.optional_call", return_value=None),
             ):
                 mocked_start.return_value = {
                     "job_id": "device-test",
@@ -1051,7 +1052,7 @@ class McpServerTests(unittest.TestCase):
         )
         mocked_run.assert_not_called()
 
-    def test_sdk_refresh_metadata_uses_local_sdk_main_target(self) -> None:
+    def test_sdk_refresh_metadata_uses_parent_selected_by_device(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             local_sdk = root / "sdks" / "sfossdk" / "sdk-chroot"
@@ -1098,10 +1099,63 @@ class McpServerTests(unittest.TestCase):
         argv = list(mocked_run.call_args.args[0])
         self.assertEqual(argv[:3], ["docker", "run", "--rm"])
         wrapper = argv[-1]
-        self.assertIn("sb2 -t aarch64.default -m sdk-install -R zypper ref", wrapper)
+        self.assertIn("sb2 -t aarch64 -m sdk-install -R zypper ref", wrapper)
         self.assertEqual(
             response["result"]["structuredContent"]["main_target"],
-            "aarch64.default",
+            "aarch64",
+        )
+
+    def test_sdk_refresh_metadata_honors_explicit_parent_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            local_sdk = root / "sdks" / "sfossdk" / "sdk-chroot"
+            local_sdk.parent.mkdir(parents=True)
+            local_sdk.touch()
+            self.write_fake_target(
+                local_sdk.parent,
+                "aarch64",
+                ssu_release="live",
+                version_id="5.2.0.4",
+            )
+            config = Config(
+                path=None,
+                default_device="phone",
+                devices={
+                    "phone": DeviceConfig(
+                        name="phone",
+                        ssh_target="root@phone",
+                        architecture="aarch64",
+                        release="live",
+                    )
+                },
+                paths=PathConfig(
+                    git_root=root,
+                    ssh_config=root / "ssh_config",
+                    local_sdk=local_sdk,
+                ),
+            )
+            server = McpServer(config)
+            with patch("sailfish_devel_mcp.tools.run") as mocked_run:
+                mocked_run.return_value = CommandResult(("docker",), 0, "", "")
+                response = server.handle(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 13,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "sailfish_sdk_refresh_metadata",
+                            "arguments": {"wait": True, "target": "aarch64"},
+                        },
+                    }
+                )
+        self.assertFalse(response["result"].get("isError", False))
+        argv = list(mocked_run.call_args.args[0])
+        self.assertEqual(argv[:3], ["docker", "run", "--rm"])
+        wrapper = argv[-1]
+        self.assertIn("sb2 -t aarch64 -m sdk-install -R zypper ref", wrapper)
+        self.assertEqual(
+            response["result"]["structuredContent"]["main_target"],
+            "aarch64",
         )
 
     def test_sdk_refresh_metadata_uses_project_snapshot_directly(self) -> None:
