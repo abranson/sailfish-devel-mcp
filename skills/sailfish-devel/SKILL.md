@@ -98,6 +98,14 @@ Use `sailfish_android_build` for configured Android/AppSupport hosts and
 recorded OBS server, package set and branch mapping. Use `$build-sailfishos` when
 choosing RPM build targets, snapshot inputs or packaging options.
 
+Use `sailfish_obs_source_pin` for authorized `_service` revision/branch changes.
+Read or preview first; apply the same changes with the original `sha256` as
+`expected_sha256` and an OBS commit comment. Select `service_index` when multiple
+pins exist. Apply rechecks for stale content but cannot atomically exclude other
+OBS writers; coordinate changes. It can trigger remote services/builds. Read back
+an `unknown` or `committed_unverified` outcome before retrying, never replay it
+blindly. The host needs `osc` and the selected server's configured credentials.
+
 If an expected MCP tool loses its transport, inspect
 `~/.local/state/sailfish-devel-mcp/server.log`, report the failure and stop instead
 of silently switching to SSH. When MCP is unavailable from the outset, follow the

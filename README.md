@@ -27,7 +27,7 @@ The server currently exposes tools for:
 - preflighted Docker/mb2 RPM builds through the vendored `build-sailfishos` helper
 - cancellable local and remote Android/AppSupport build jobs
 - installed SDK repository metadata refresh
-- OBS result and build-log lookup through `osc`
+- OBS results, build logs, and guarded source-pin edits through `osc`
 - repository status and search under the configured git root
 - RPM spec metadata summaries
 - QML translation search and Sailfish ternary translation checks
@@ -74,7 +74,7 @@ listed; installing every optional tool is unnecessary.
 | QML translation search | `rg`; the ternary-comment checker itself needs only Python |
 | RPM builds and SDK refresh | A running Docker engine accessible to your user, `git`, and `bash`; ACL tools (`setfacl`) for Docker builds that need container write access |
 | Installed SDK builds | A configured Sailfish Platform SDK `sdk-chroot`, registered architecture targets, and an appropriate Docker wrapper image; `sdk-manage`, `mb2`, `sb2`, `zypper`, RPM and build dependencies live inside the SDK |
-| OBS results and logs | `osc`, with the selected server and credentials configured in your `.oscrc` |
+| OBS results, logs and source-pin edits | Required: `osc`, with the selected server and credentials configured in your `.oscrc` |
 | Android/AppSupport builds | `ssh`; a separate configured Linux build host with its Android tree and build dependencies |
 
 Run the MCP tool `sailfish_doctor` to report local command availability, helper
@@ -412,6 +412,7 @@ Mutating tools are annotated as non-read-only:
 - `sailfish_android_build`
 - `sailfish_android_build_cancel`
 - `sailfish_sdk_refresh_metadata`
+- `sailfish_obs_source_pin` (`apply`)
 
 `sailfish_device_lipstick_screenshot` defaults to
 `~/Pictures/Screenshots/lipstick-<timestamp>.png` under `/home/<username>`,
@@ -544,7 +545,7 @@ exact requested target using the same privileged Docker wrapper as local builds.
 that specific snapshot. No `.default` suffix is inferred. Use it when local SDK builds fail because a
 package listed in repository metadata cannot be downloaded.
 
-`sailfish_obs_results` and `sailfish_obs_buildlog` accept a friendly `server`
+The OBS tools, including `sailfish_obs_source_pin`, accept a friendly `server`
 name configured in `paths.obs_servers`; each value is an `.oscrc` alias or API
 URL passed to `osc -A`. Omit `server` to use `paths.osc_api_alias`. The advanced
 `api_alias` argument accepts any raw `osc -A` alias or API URL and cannot be
@@ -562,6 +563,45 @@ to use `osc remotebuildlog`.
 
 Read-only tools include build preflight/status, the journal, topmost PID,
 process maps, OBS lookup, repo search, spec summary, and QML checks.
+
+### OBS source pins
+
+`sailfish_obs_source_pin` edits an existing `_service` revision parameter and,
+optionally, its existing branch parameter. It uses `osc api` and your configured
+credentials. No local OBS checkout is needed. Install `osc` through your Linux
+distribution; it is an external executable, not a Python package dependency.
+
+- `action: "read"` (default): return source pins and the file's `sha256`.
+- `action: "preview"`: supply `revision` and optionally `branch`; return before/
+  after values, the original `sha256` and `new_sha256`, without a remote write.
+- `action: "apply"`: supply the same changes, `expected_sha256` copied from the
+  read/preview, and an OBS commit `comment`. If there are multiple source pins,
+  supply the zero-based `service_index` returned by read.
+
+For example, after reading `home:example:feature/sample`, preview with:
+
+```json
+{"project":"home:example:feature","package":"sample","action":"preview","revision":"v1.2.3"}
+```
+
+Apply with the returned original hash and a meaningful comment. The tool checks
+the whole `_service` hash and rechecks immediately before uploading only that
+file. Existing XML formatting, comments and unrelated parameters are preserved;
+the tool does not change repository URLs or create missing parameters. It
+refuses packages with staged OBS uploads to avoid committing another operation's
+unfinished work. It does not resolve Git refs or check whether a commit has been
+pushed. Follow the project's authorized OBS server, package and branch mapping.
+
+The [OBS file-write API](https://github.com/openSUSE/open-build-service/blob/master/src/backend/bs_srcserver)
+does not provide an atomic conditional update: another writer can still change
+the package between the final check and upload. Coordinate concurrent writers.
+Applying creates an OBS source revision and can trigger the configured remote
+source services and builds; the tool does not wait for them. An unchanged pin
+does not create a commit. Successful writes are verified at the returned OBS
+revision. `unknown` or `committed_unverified` means inspect/read back before any
+retry; never blindly repeat a write. The total operation timeout is at most
+15 seconds. Because apply writes remotely, the tool is annotated as mutating
+even though read and preview do not write.
 
 ## Smoke Test
 

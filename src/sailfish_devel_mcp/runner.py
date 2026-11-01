@@ -87,13 +87,14 @@ def run(
     *,
     cwd: str | Path | None = None,
     timeout: int = 60,
+    text: bool = True,
 ) -> CommandResult:
     try:
         completed = subprocess.run(
             list(argv),
             cwd=str(cwd) if cwd is not None else None,
             stdin=subprocess.DEVNULL,
-            text=True,
+            text=text,
             capture_output=True,
             timeout=timeout,
             check=False,

@@ -13,12 +13,15 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Callable
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 import uuid
+from xml.etree import ElementTree
 
 from .config import AndroidBuildHostConfig, Config, DeviceConfig
+from .obs import edit_source_pin, public_pin, service_sha256, source_pins
 from .runner import (
     CommandResult,
     remote_command,
@@ -201,6 +204,7 @@ def build_registry(config: Config) -> dict[str, Tool]:
         ),
         Tool(_spec_obs_results(), lambda args: handle_obs_results(config, args)),
         Tool(_spec_obs_buildlog(), lambda args: handle_obs_buildlog(config, args)),
+        Tool(_spec_obs_source_pin(), lambda args: handle_obs_source_pin(config, args)),
         Tool(_spec_repo_status(), lambda args: handle_repo_status(config, args)),
         Tool(_spec_repo_find(), lambda args: handle_repo_find(config, args)),
         Tool(_spec_spec_summary(), lambda args: handle_spec_summary(config, args)),
@@ -2210,6 +2214,112 @@ def handle_obs_buildlog(config: Config, args: dict[str, Any]) -> dict[str, Any]:
         },
         verbose=verbose,
     )
+
+
+def handle_obs_source_pin(config: Config, args: dict[str, Any]) -> dict[str, Any]:
+    action = _enum_arg(args, "action", ["read", "preview", "apply"], default="read")
+    project, package = (_str_arg(args, name) for name in ("project", "package"))
+    for value in (project, package):
+        if value in (".", "..") or "/" in value or any(ord(c) < 32 for c in value):
+            raise ValueError("project and package must be single OBS path components")
+    server, alias = _obs_server_selection(config, args)
+    timeout = _int_arg(args, "timeout", default=15, minimum=1, maximum=15)
+    index = _int_arg(args, "service_index", minimum=0) if "service_index" in args else None
+    revision = _str_arg(args, "revision") if action != "read" else None
+    branch = _str_arg(args, "branch") if "branch" in args else None
+    expected = _str_arg(args, "expected_sha256") if action == "apply" else None
+    comment = _str_arg(args, "comment") if action == "apply" else None
+    if action == "read" and any(key in args for key in ("revision", "branch", "expected_sha256", "comment")):
+        raise ValueError("read does not accept pin changes; use preview or apply")
+    if expected is not None and not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise ValueError("expected_sha256 must be the hash returned by read or preview")
+    if comment is not None and not comment.strip():
+        raise ValueError("comment must not be blank")
+    if shutil.which("osc") is None:
+        return tool_error("osc is required for OBS source pins; install it using your distribution's package manager")
+
+    command = ["osc", "-A", alias] if alias else ["osc"]
+    path = f"/source/{quote(project, safe='')}/{quote(package, safe='')}/_service"
+    deadline = time.monotonic() + timeout
+    data = {"action": action, "server": server, "api_alias": alias,
+            "project": project, "package": package, "status": "not_applied"}
+
+    def request(query, *, upload=None, package_files=False):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return CommandResult(tuple(command), 124, "", "source-pin operation deadline expired")
+        options = ["-X", "PUT", "-T", str(upload)] if upload is not None else []
+        resource = path.rsplit("/", 1)[0] if package_files else path
+        return run(command + ["api"] + options + [resource + "?" + urlencode(query)],
+                   timeout=remaining, text=False)
+
+    def failed(title, result, details):
+        # A failed GET can contain partial service XML, including private parameters.
+        return tool_error(title, {**details, "returncode": result.returncode,
+                                  "stderr": truncate(result.stderr, 2000)[0]})
+
+    current = request({"rev": "latest"})
+    if not current.ok:
+        return failed("read OBS source pin failed", current, data)
+    digest = service_sha256(current.stdout)
+    data["sha256"] = digest
+    pins = source_pins(current.stdout)
+    data["pins"] = [public_pin(pin) for pin in pins]
+    if action == "read":
+        data["status"] = "read"
+        return ok_text(json.dumps(data, separators=(",", ":")), data)
+    if expected is not None and digest != expected:
+        return tool_error("_service changed since read/preview; read it again before applying",
+                          {**data, "status": "conflict"})
+    updated, change = edit_source_pin(current.stdout, pins, index, revision, branch)
+    data.update(change)
+    data["new_sha256"] = service_sha256(updated)
+    if action == "preview" or updated == current.stdout:
+        data["status"] = "preview" if action == "preview" else "unchanged"
+        return ok_text(json.dumps(data, separators=(",", ":")), data)
+
+    with tempfile.TemporaryDirectory(prefix="sailfish-obs-pin-") as directory:
+        upload = Path(directory) / "_service"
+        upload.write_text(updated, encoding="utf-8")
+        # PUT without rev commits from the upload view. Refuse another writer's
+        # staged upload; a PUT with rev=latest only stores an internal revision.
+        latest = request({"rev": "upload"}, package_files=True)
+        if not latest.ok:
+            return failed("recheck OBS source pin failed", latest, data)
+        try:
+            listing = ElementTree.fromstring(latest.stdout)
+            if listing.tag != "directory" or not listing.get("rev", "").isdecimal():
+                raise ValueError("package has staged uploads or no committed revision")
+            entries = [entry for entry in listing.findall("entry") if entry.get("name") == "_service"]
+            current_md5 = entries[0].get("md5") if len(entries) == 1 else None
+        except (ElementTree.ParseError, ValueError):
+            return tool_error("cannot safely commit: package has staged uploads or an invalid file listing",
+                              {**data, "status": "conflict"})
+        if current_md5 != hashlib.md5(current.stdout.encode("utf-8"), usedforsecurity=False).hexdigest():
+            return tool_error("_service changed before upload; read it again before applying",
+                              {**data, "status": "conflict"})
+        if deadline <= time.monotonic():
+            return tool_error("source-pin operation deadline expired before upload", data)
+        result = request({"comment": comment}, upload=upload)
+    if not result.ok:
+        return failed("OBS source-pin write outcome unknown; read before retrying", result,
+                      {**data, "status": "unknown", "retry_safe": False})
+    try:
+        receipt = ElementTree.fromstring(result.stdout)
+        committed_revision = receipt.get("rev") if receipt.tag == "revision" else None
+        if not committed_revision or not committed_revision.isdecimal():
+            raise ValueError("missing OBS commit revision")
+    except (ElementTree.ParseError, ValueError):
+        return tool_error("OBS returned no commit revision; read before retrying",
+                          {**data, "status": "unknown", "retry_safe": False})
+    data.update(status="committed_unverified", obs_revision=committed_revision, retry_safe=False)
+    verified = request({"rev": committed_revision})
+    if not verified.ok:
+        return failed("OBS pin committed but readback failed; do not repeat the write", verified, data)
+    if service_sha256(verified.stdout) != data["new_sha256"]:
+        return tool_error("OBS pin committed but readback differs; inspect before further writes", data)
+    data["status"] = "applied"
+    return ok_text(json.dumps(data, separators=(",", ":")), data)
 
 
 def _obs_results_pending(stdout: str) -> bool:
@@ -4249,6 +4359,35 @@ def _spec_obs_results() -> dict[str, Any]:
             ["project"],
         ),
         "annotations": _read_only_annotations("OBS Results"),
+    }
+
+
+def _spec_obs_source_pin() -> dict[str, Any]:
+    return {
+        "name": "sailfish_obs_source_pin",
+        "title": "OBS Source Pin",
+        "description": (
+            "Read, preview or apply an existing _service revision pin and optional branch. "
+            "Apply requires expected_sha256 from read/preview and a commit comment; it rechecks "
+            "before writing, but OBS has no atomic conditional file write. Preserve the project's "
+            "authorized OBS mapping. A commit can trigger server-side services/builds. "
+            "Never repeat an unknown write outcome without reading back first."
+        ),
+        "inputSchema": _object_schema({
+            "project": {"type": "string"}, "package": {"type": "string"},
+            "server": {"type": "string", "description": "Named OBS server configured in paths.obs_servers."},
+            "api_alias": {"type": "string", "description": "Raw osc API alias or URL; cannot be combined with server."},
+            "action": {"type": "string", "enum": ["read", "preview", "apply"], "default": "read"},
+            "service_index": {"type": "integer", "minimum": 0,
+                              "description": "Zero-based service index from read; required when multiple pins exist."},
+            "revision": {"type": "string", "description": "New revision (commit, tag or branch); required for preview/apply."},
+            "branch": {"type": "string", "description": "Optionally replace the existing branch parameter."},
+            "expected_sha256": {"type": "string", "description": "Original _service hash from read/preview; required for apply."},
+            "comment": {"type": "string", "description": "OBS commit comment; required for apply."},
+            "timeout": {"type": "integer", "minimum": 1, "maximum": 15, "default": 15,
+                        "description": "Total operation deadline in seconds, including readback."},
+        }, ["project", "package"]),
+        "annotations": _mutating_annotations("OBS Source Pin"),
     }
 
 
